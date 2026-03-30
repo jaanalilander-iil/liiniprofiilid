@@ -2,13 +2,13 @@
 prepare_data.py
 ---------------
 Teisendab Remix AVL ekspordi (4.0.3 Detailne liinide väljumine)
-profiilide dashboardi jaoks sobivaks JSON-iks.
+profiilide dashboardi jaoks sobivaks Parquet-failiks.
 
 Kasutus:
-    python prepare_data.py andmed.csv            # -> data/data_<periood>.json + manifest
-    python prepare_data.py andmed.csv minu.json  # -> minu.json (manifest ei uuene)
+    python prepare_data.py andmed.csv            # -> data/data_<periood>.parquet + manifest
+    python prepare_data.py andmed.csv minu.parquet  # -> minu.parquet (manifest ei uuene)
 
-Eeldab: pandas  (pip install pandas)
+Eeldab: pandas pyarrow  (pip install pandas pyarrow)
 """
 
 import sys
@@ -17,9 +17,11 @@ import os
 import re
 import glob
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
-DATA_DIR = "data"  # alamkaust kuhu JSON-id kirjutatakse
+DATA_DIR = "data"  # alamkaust kuhu Parquet-failid kirjutatakse
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -51,7 +53,8 @@ def extract_period_from_header(path: str) -> str:
     return "periood_tundmatu"
 
 
-def build_raw(df: pd.DataFrame) -> dict:
+def build_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Puhasta ja teisenda CSV -> tasane DataFrame ühe reaga peatuse kohta."""
     df = df.rename(columns={
         "Peatuse jrk":           "jrk",
         "Liin":                  "liin",
@@ -81,69 +84,40 @@ def build_raw(df: pd.DataFrame) -> dict:
 
     print(f"  Kehtivaid ridu: {len(df):,}")
 
-    # Unikaalne väljumine = veoots + kuupäev (sama veoots käib iga päev!)
+    # Unikaalne väljumine = veoots + kuupäev
     df["dep_date"] = df["planned_dep"].dt.normalize()
 
-    RAW = {}
-    for liin, lgrp in df.groupby("liin"):
-        trips = []
-        for (veoots, dep_date), tgrp in lgrp.groupby(["veoots", "dep_date"]):
-            tgrp = tgrp.sort_values("jrk")
-            dep = tgrp.iloc[0]["planned_dep"]
-            date_str = dep.strftime("%d.%m.%Y") if pd.notna(dep) else ""
-            time_str = dep.strftime("%H:%M")     if pd.notna(dep) else ""
-            stops = [
-                {
-                    "jrk":    int(r["jrk"]),
-                    "peatus": str(r["peatus"]),
-                    "board":  round(float(r["board"]),  2),
-                    "alight": round(float(r["alight"]), 2),
-                    "pardal": round(float(r["pardal"]), 2),
-                }
-                for _, r in tgrp.iterrows()
-            ]
-            trips.append({"veoots": veoots, "date": date_str, "time": time_str, "stops": stops})
+    # Tuleta kuupäev ja kellaaeg esimesest peatusest (jrk==min) iga väljumise kohta
+    first = (
+        df.sort_values("jrk")
+        .groupby(["liin", "veoots", "dep_date"])["planned_dep"]
+        .first()
+        .reset_index()
+        .rename(columns={"planned_dep": "dep_dt"})
+    )
+    df = df.merge(first, on=["liin", "veoots", "dep_date"], how="left")
+    df["date"] = df["dep_dt"].dt.strftime("%d.%m.%Y").fillna("")
+    df["time"] = df["dep_dt"].dt.strftime("%H:%M").fillna("")
 
-        stop_acc: dict = {}
-        for t in trips:
-            for s in t["stops"]:
-                k = s["jrk"]
-                if k not in stop_acc:
-                    stop_acc[k] = {"jrk": k, "peatus": s["peatus"], "b": [], "a": [], "p": []}
-                stop_acc[k]["b"].append(s["board"])
-                stop_acc[k]["a"].append(s["alight"])
-                stop_acc[k]["p"].append(s["pardal"])
-
-        avg = sorted(
-            [
-                {
-                    "jrk":    v["jrk"],
-                    "peatus": v["peatus"],
-                    "board":  round(sum(v["b"]) / len(v["b"]), 2),
-                    "alight": round(sum(v["a"]) / len(v["a"]), 2),
-                    "pardal": round(sum(v["p"]) / len(v["p"]), 2),
-                }
-                for v in stop_acc.values()
-            ],
-            key=lambda x: x["jrk"],
-        )
-        RAW[liin] = {"n_trips": len(trips), "avg": avg, "trips": trips}
-
-    return RAW
+    # Jäta ainult vajalikud veerud
+    out = df[["liin", "veoots", "date", "time", "jrk", "peatus", "board", "alight", "pardal"]].copy()
+    out["board"]  = out["board"].round(2)
+    out["alight"] = out["alight"].round(2)
+    out["pardal"] = out["pardal"].round(2)
+    return out
 
 
 def update_manifest(data_dir: str) -> None:
     """Skanni data/ kaust ja kirjuta manifest.json."""
-    files = sorted(glob.glob(os.path.join(data_dir, "data_*.json")))
+    files = sorted(glob.glob(os.path.join(data_dir, "data_*.parquet")))
     entries = []
     for f in files:
         fname = os.path.basename(f)
-        # Tuleta periood failinimest: data_2025-02-01_2025-07-31.json
-        m = re.search(r"data_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json", fname)
+        m = re.search(r"data_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.parquet", fname)
         if m:
             label = f"{m.group(1)} – {m.group(2)}"
         else:
-            label = fname.replace("data_", "").replace(".json", "")
+            label = fname.replace("data_", "").replace(".parquet", "")
         entries.append({"file": f"data/{fname}", "label": label})
 
     manifest_path = os.path.join(data_dir, "manifest.json")
@@ -160,32 +134,29 @@ def main():
         sys.exit(1)
 
     csv_path = sys.argv[1]
-
-    # Kui kasutaja annab valjundfaili ise ette, kasuta seda (vana kasutusviis)
     custom_out = sys.argv[2] if len(sys.argv) > 2 else None
 
     print(f"Loen: {csv_path}")
     df = load_csv(csv_path)
     print(f"  Ridu: {len(df):,}  |  Veerge: {len(df.columns)}")
 
-    raw = build_raw(df)
-    liine   = len(raw)
-    valja   = sum(d["n_trips"] for d in raw.values())
-    peatusi = sum(len(d["avg"]) for d in raw.values())
-    print(f"  Liine: {liine}  |  Valjumisi: {valja:,}  |  Peatusi (keskmised): {peatusi:,}")
+    out = build_df(df)
+    liine  = out["liin"].nunique()
+    valja  = out.groupby(["liin", "veoots", "date"]).ngroups
+    print(f"  Liine: {liine}  |  Väljumisi: {valja:,}  |  Ridu: {len(out):,}")
 
     if custom_out:
-        json_path = custom_out
+        parquet_path = custom_out
     else:
         os.makedirs(DATA_DIR, exist_ok=True)
-        period    = extract_period_from_header(csv_path)
-        json_path = os.path.join(DATA_DIR, f"data_{period}.json")
+        period       = extract_period_from_header(csv_path)
+        parquet_path = os.path.join(DATA_DIR, f"data_{period}.parquet")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, separators=(",", ":"))
+    table = pa.Table.from_pandas(out, preserve_index=False)
+    pq.write_table(table, parquet_path, compression="zstd")
 
-    size_kb = os.path.getsize(json_path) / 1024
-    print(f"Kirjutatud: {json_path}  ({size_kb:.0f} KB)")
+    size_mb = os.path.getsize(parquet_path) / 1024 / 1024
+    print(f"Kirjutatud: {parquet_path}  ({size_mb:.1f} MB)")
 
     if not custom_out:
         print()

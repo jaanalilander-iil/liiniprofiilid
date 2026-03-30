@@ -3,8 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Liinide väljumisprofiilid</title>
+<title>Kagu ÜTK liiniprofiilid</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-mvp.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -383,20 +384,14 @@
 </main>
 
 <script>
-// ── Data loader ─────────────────────────────────────────────────────────────
-// Ootab manifest.json kaustas perioodide loendi jaoks.
-// Kasutaja valib kuupäevavahemiku -> laaditakse sobiv periood automaatselt.
-
-let RAW = {};
-let MANIFEST = null;
-let LOADED_PERIOD_FILE = null;
-
-// ── Kalender + andmete laadimine ────────────────────────────────────────────
+// ── DuckDB-WASM + Kalender + andmete laadimine ──────────────────────────────
 
 const MONTHS_ET = ['Jaanuar','Veebruar','Märts','Aprill','Mai','Juuni',
                    'Juuli','August','September','Oktober','November','Detsember'];
 
-let RAW_FULL = {};
+let DB = null;          // DuckDB ühendus
+let RAW = {};           // aktiivne filtreeritud andmestik (index.html loogika jaoks)
+let RAW_FULL = {};      // kogu laetud andmestik
 let CAL_MIN = null, CAL_MAX = null;
 let calSelStart = null, calSelEnd = null;
 let calIsAll = true;
@@ -419,14 +414,14 @@ function fmtDisplay(d) {
 async function loadData() {
   const loadingEl = document.getElementById('loading-state');
   try {
+    // 1) Loe manifest
     const mResp = await fetch('manifest.json');
     if (!mResp.ok) throw new Error('manifest.json: HTTP ' + mResp.status);
     const raw = await mResp.json();
     const periods = Array.isArray(raw) ? raw : (raw.periods || []);
     if (!periods.length) throw new Error('manifest.json on tühi');
-    MANIFEST = { periods };
 
-    // Leia kogu andmestiku min/max
+    // 2) Leia kuupäevapiirid
     let absMin = '9999-99-99', absMax = '0000-00-00';
     periods.forEach(p => {
       const d = parsePeriodDates(p.label || p.file);
@@ -445,8 +440,8 @@ async function loadData() {
 
     initCalendar();
 
-    // Laadi kõik perioodid (kogu periood vaikimisi)
-    await loadAllPeriods(periods);
+    // 3) Initsialiseeri DuckDB ja laadi Parquet failid
+    await initDuckDB(periods);
 
     if (loadingEl) loadingEl.remove();
     initApp();
@@ -459,26 +454,76 @@ async function loadData() {
   }
 }
 
-async function loadAllPeriods(periods) {
-  // Laadi kõik perioodid ja liida kokku RAW_FULL-iks
-  RAW_FULL = {};
+async function initDuckDB(periods) {
+  // Initsialiseeri DuckDB-WASM
+  const JSDELIVR = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/';
+  const bundle = await duckdb.selectBundle({
+    mvp: { mainModule: JSDELIVR + 'duckdb-mvp.wasm', mainWorker: JSDELIVR + 'duckdb-browser-mvp.worker.js' },
+    eh:  { mainModule: JSDELIVR + 'duckdb-eh.wasm',  mainWorker: JSDELIVR + 'duckdb-browser-eh.worker.js'  },
+  });
+  const worker = await duckdb.createWorker(bundle.mainWorker);
+  const logger = new duckdb.ConsoleLogger();
+  DB = new duckdb.AsyncDuckDB(logger, worker);
+  await DB.instantiate(bundle.mainModule);
+  const conn = await DB.connect();
+
+  // Laadi kõik Parquet failid ühte tabelisse
+  const views = [];
   for (const p of periods) {
     const resp = await fetch(p.file);
     if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — ' + p.file);
-    const data = await resp.json();
-    for (const [liin, ld] of Object.entries(data)) {
-      if (!RAW_FULL[liin]) {
-        RAW_FULL[liin] = { trips: [] };
-      }
-      RAW_FULL[liin].trips.push(...ld.trips);
-    }
+    const buf = await resp.arrayBuffer();
+    const fname = p.file.replace(/\//g, '_').replace(/[^a-zA-Z0-9_.]/g, '_');
+    await DB.registerFileBuffer(fname, new Uint8Array(buf));
+    views.push(`SELECT * FROM parquet_scan('${fname}')`);
   }
-  // Arvuta avg kogu andmestiku põhjal
-  for (const [liin, ld] of Object.entries(RAW_FULL)) {
-    RAW_FULL[liin].n_trips = ld.trips.length;
-    RAW_FULL[liin].avg = calcAvg(ld.trips);
+  await conn.query(`CREATE VIEW andmed AS ${views.join(' UNION ALL ')}`);
+
+  // Laadi kogu andmestik RAW_FULL-iks
+  await queryToRaw(conn, null, null, true);
+  await conn.close();
+}
+
+async function queryToRaw(conn, fromIso, toIso, isFull) {
+  let where = '';
+  if (fromIso || toIso) {
+    const parts = [];
+    if (fromIso) parts.push(`date >= '${fromIso.split('-').reverse().join('.')}'`);
+    if (toIso)   parts.push(`date <= '${toIso.split('-').reverse().join('.')}'`);
+    where = 'WHERE ' + parts.join(' AND ');
   }
-  RAW = RAW_FULL;
+
+  const result = await conn.query(`
+    SELECT liin, veoots, date, time, jrk, peatus,
+           board, alight, pardal
+    FROM andmed
+    ${where}
+    ORDER BY liin, veoots, date, jrk
+  `);
+
+  // Konverdi Arrow tabel JS objektideks
+  const rows = result.toArray().map(r => ({
+    liin: r.liin, veoots: r.veoots, date: r.date, time: r.time,
+    jrk: r.jrk, peatus: r.peatus,
+    board: r.board, alight: r.alight, pardal: r.pardal
+  }));
+
+  const dest = {};
+  for (const r of rows) {
+    if (!dest[r.liin]) dest[r.liin] = {};
+    const key = r.veoots + '|' + r.date;
+    if (!dest[r.liin][key]) dest[r.liin][key] = { veoots: r.veoots, date: r.date, time: r.time, stops: [] };
+    dest[r.liin][key].stops.push({ jrk: r.jrk, peatus: r.peatus, board: r.board, alight: r.alight, pardal: r.pardal });
+  }
+
+  const target = isFull ? RAW_FULL : null;
+  const out = {};
+  for (const [liin, tripMap] of Object.entries(dest)) {
+    const trips = Object.values(tripMap);
+    out[liin] = { n_trips: trips.length, avg: calcAvg(trips), trips };
+  }
+  if (isFull) { RAW_FULL = out; RAW = out; }
+  else { RAW = out; }
 }
 
 function calcAvg(trips) {
@@ -500,6 +545,7 @@ function calcAvg(trips) {
 }
 
 function filterRawByDates(fromIso, toIso) {
+  // Filtreeri RAW_FULL-ist mälus (DuckDB on juba andmed laadinud)
   RAW = {};
   for (const [liin, data] of Object.entries(RAW_FULL)) {
     const filtered = data.trips.filter(t => {
