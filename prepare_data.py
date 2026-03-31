@@ -153,7 +153,7 @@ def main():
         parquet_path = os.path.join(DATA_DIR, f"data_{period}.parquet")
 
     table = pa.Table.from_pandas(out, preserve_index=False)
-    pq.write_table(table, parquet_path, compression="zstd")
+    pq.write_table(table, parquet_path, compression="snappy")
 
     size_mb = os.path.getsize(parquet_path) / 1024 / 1024
     print(f"Kirjutatud: {parquet_path}  ({size_mb:.1f} MB)")

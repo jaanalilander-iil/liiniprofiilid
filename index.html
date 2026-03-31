@@ -64,13 +64,6 @@
     align-items: flex-end;
     gap: 10px;
     flex-wrap: wrap;
-  }
-
-  .header-controls-row {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: flex-end;
     flex: 1;
   }
   .ctrl-group { display: flex; flex-direction: column; gap: 3px; }
@@ -383,13 +376,12 @@
 </main>
 
 <script>
-// ── DuckDB-WASM + Kalender + andmete laadimine ──────────────────────────────
+// ── Andmete laadimine (hyparquet) + Kalender ───────────────────────────────
 
 const MONTHS_ET = ['Jaanuar','Veebruar','Märts','Aprill','Mai','Juuni',
                    'Juuli','August','September','Oktober','November','Detsember'];
 
-let DB = null;          // DuckDB ühendus
-let RAW = {};           // aktiivne filtreeritud andmestik (index.html loogika jaoks)
+let RAW = {};           // aktiivne filtreeritud andmestik
 let RAW_FULL = {};      // kogu laetud andmestik
 let CAL_MIN = null, CAL_MAX = null;
 let calSelStart = null, calSelEnd = null;
@@ -439,8 +431,8 @@ async function loadData() {
 
     initCalendar();
 
-    // 3) Initsialiseeri DuckDB ja laadi Parquet failid
-    await initDuckDB(periods);
+    // 3) Laadi Parquet failid
+    await loadParquet(periods);
 
     if (loadingEl) loadingEl.remove();
     initApp();
@@ -453,86 +445,57 @@ async function loadData() {
   }
 }
 
-async function initDuckDB(periods) {
-  // Laadi DuckDB-WASM dünaamiliselt ESM-ina
-  const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm');
-  const JSDELIVR = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/';
+async function loadParquet(periods) {
+  // Laadi hyparquet ESM — toetab snappy vaikimisi, pole lisateeke vaja
+  const { parquetRead } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.9.1/src/read.js');
 
-  const bundle = await duckdb.selectBundle({
-    mvp: {
-      mainModule: JSDELIVR + 'duckdb-mvp.wasm',
-      mainWorker: JSDELIVR + 'duckdb-browser-mvp.worker.js',
-    },
-    eh: {
-      mainModule: JSDELIVR + 'duckdb-eh.wasm',
-      mainWorker: JSDELIVR + 'duckdb-browser-eh.worker.js',
-    },
-  });
-
-  const workerUrl = URL.createObjectURL(
-    new Blob(['importScripts("' + bundle.mainWorker + '");'], { type: 'text/javascript' })
-  );
-  const worker = new Worker(workerUrl);
-  const logger = new duckdb.ConsoleLogger();
-  DB = new duckdb.AsyncDuckDB(logger, worker);
-  await DB.instantiate(bundle.mainModule);
-  URL.revokeObjectURL(workerUrl);
-
-  const conn = await DB.connect();
-
-  // Laadi kõik Parquet failid
-  const views = [];
+  const allRows = [];
   for (const p of periods) {
     const resp = await fetch(p.file);
     if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — ' + p.file);
     const buf = await resp.arrayBuffer();
-    const fname = p.file.replace(/[^a-zA-Z0-9_.]/g, '_');
-    await DB.registerFileBuffer(fname, new Uint8Array(buf));
-    views.push(`SELECT * FROM parquet_scan('${fname}')`);
+    await new Promise((resolve, reject) => {
+      parquetRead({
+        file: buf,
+        rowFormat: 'object',
+        onComplete: rows => {
+          rows.forEach(r => allRows.push({
+            liin:   String(r.liin   ?? ''),
+            veoots: String(r.veoots ?? ''),
+            date:   String(r.date   ?? ''),
+            time:   String(r.time   ?? ''),
+            jrk:    Number(r.jrk    ?? 0),
+            peatus: String(r.peatus ?? ''),
+            board:  Number(r.board  ?? 0),
+            alight: Number(r.alight ?? 0),
+            pardal: Number(r.pardal ?? 0),
+          }));
+          resolve();
+        },
+      }).catch(reject);
+    });
   }
-  await conn.query(`CREATE VIEW andmed AS ${views.join(' UNION ALL ')}`);
-
-  await queryToRaw(conn, null, null, true);
-  await conn.close();
+  rowsToRaw(allRows, true);
 }
 
-async function queryToRaw(conn, fromIso, toIso, isFull) {
-  let where = '';
-  if (fromIso || toIso) {
-    const parts = [];
-    if (fromIso) parts.push(`date >= '${fromIso.split('-').reverse().join('.')}'`);
-    if (toIso)   parts.push(`date <= '${toIso.split('-').reverse().join('.')}'`);
-    where = 'WHERE ' + parts.join(' AND ');
-  }
-
-  const result = await conn.query(`
-    SELECT liin, veoots, date, time, jrk, peatus,
-           board, alight, pardal
-    FROM andmed
-    ${where}
-    ORDER BY liin, veoots, date, jrk
-  `);
-
-  // Konverdi Arrow tabel JS objektideks
-  const rows = result.toArray().map(r => ({
-    liin: String(r.liin), veoots: String(r.veoots),
-    date: String(r.date), time: String(r.time),
-    jrk: Number(r.jrk), peatus: String(r.peatus),
-    board: Number(r.board), alight: Number(r.alight), pardal: Number(r.pardal)
-  }));
-
+function rowsToRaw(rows, isFull) {
   const dest = {};
   for (const r of rows) {
     if (!dest[r.liin]) dest[r.liin] = {};
     const key = r.veoots + '|' + r.date;
-    if (!dest[r.liin][key]) dest[r.liin][key] = { veoots: r.veoots, date: r.date, time: r.time, stops: [] };
-    dest[r.liin][key].stops.push({ jrk: r.jrk, peatus: r.peatus, board: r.board, alight: r.alight, pardal: r.pardal });
+    if (!dest[r.liin][key]) {
+      dest[r.liin][key] = { veoots: r.veoots, date: r.date, time: r.time, stops: [] };
+    }
+    dest[r.liin][key].stops.push({
+      jrk: r.jrk, peatus: r.peatus,
+      board: r.board, alight: r.alight, pardal: r.pardal
+    });
   }
-
-  const target = isFull ? RAW_FULL : null;
   const out = {};
   for (const [liin, tripMap] of Object.entries(dest)) {
     const trips = Object.values(tripMap);
+    // Sorteeri stops jrk järgi igas väljumises
+    trips.forEach(t => t.stops.sort((a, b) => a.jrk - b.jrk));
     out[liin] = { n_trips: trips.length, avg: calcAvg(trips), trips };
   }
   if (isFull) { RAW_FULL = out; RAW = out; }
@@ -558,7 +521,7 @@ function calcAvg(trips) {
 }
 
 function filterRawByDates(fromIso, toIso) {
-  // Filtreeri RAW_FULL-ist mälus (DuckDB on juba andmed laadinud)
+  // Filtreeri RAW_FULL-ist mälus kuupäevavahemiku järgi
   RAW = {};
   for (const [liin, data] of Object.entries(RAW_FULL)) {
     const filtered = data.trips.filter(t => {
@@ -595,15 +558,19 @@ function initCalendar() {
     trigger.classList.toggle('open', !isOpen);
   });
 
-  document.addEventListener('click', (e) => {
-    if (!document.getElementById('period-ctrl-group').contains(e.target)) {
-      // Sulge ainult kui vahemik on täielik või pole midagi valitud
-      if (!calSelStart || calSelEnd !== null) {
-        popup.classList.remove('open');
-        trigger.classList.remove('open');
+  // Globaalne sulgemine — registreeritakse ainult üks kord
+  if (!window._calClickListenerAdded) {
+    window._calClickListenerAdded = true;
+    document.addEventListener('click', (e) => {
+      const group = document.getElementById('period-ctrl-group');
+      if (group && !group.contains(e.target)) {
+        if (!calSelStart || calSelEnd !== null) {
+          document.getElementById('cal-popup')?.classList.remove('open');
+          document.getElementById('cal-trigger')?.classList.remove('open');
+        }
       }
-    }
-  });
+    });
+  }
 
   btnAll.addEventListener('click', () => {
     calSelStart = new Date(CAL_MIN);
@@ -732,10 +699,7 @@ let currentLine = null;
 let currentTrip = 'avg';
 let chart = null;
 
-function initApp() {
-  currentLine = null;
-  currentTrip = 'avg';
-
+// DOM viited — staatilised elemendid, ei muutu kunagi
 const lineSearch = document.getElementById('line-search');
 const lineSel    = document.getElementById('line-select');
 const timeSel    = document.getElementById('time-select');
@@ -749,6 +713,10 @@ const sAvgload   = document.getElementById('s-avgload');
 const chartTitle = document.getElementById('chart-title-text');
 const chartSub   = document.getElementById('chart-subtitle');
 const tableBox   = document.getElementById('table-container');
+
+function initApp() {
+  currentLine = null;
+  currentTrip = 'avg';
 
 const ALL_LINES = Object.keys(RAW).sort((a,b) => a.localeCompare(b, undefined, {numeric:true}));
 
@@ -779,13 +747,15 @@ lineSearch.addEventListener('input', () => {
 
 function populateTimes(liin, filterTime) {
   const d = RAW[liin];
-  const times = [...new Set(d.trips.map(t => t.time))].sort();
+  // Loenda korraga ühe läbimisega
+  const timeCounts = new Map();
+  d.trips.forEach(t => timeCounts.set(t.time, (timeCounts.get(t.time) || 0) + 1));
+  const times = [...timeCounts.keys()].sort();
   timeSel.innerHTML = '<option value="all">Kõik kellaajad</option>';
   times.forEach(t => {
     const o = document.createElement('option');
     o.value = t;
-    const cnt = d.trips.filter(tr => tr.time === t).length;
-    o.textContent = `${t}  (${cnt}×)`;
+    o.textContent = `${t}  (${timeCounts.get(t)}×)`;
     if (t === filterTime) o.selected = true;
     timeSel.appendChild(o);
   });
@@ -899,6 +869,18 @@ function renderChart() {
   const maxVal = Math.max(...boardData, ...alightData.map(Math.abs), ...pardalData, 1);
 
   const ctx = document.getElementById('mainChart').getContext('2d');
+
+  // Uuenda olemasolevat graafikut kui võimalik (kiirem kui destroy+new)
+  if (chart && chart.data.labels.length === labels.length) {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = boardData;
+    chart.data.datasets[1].data = alightData;
+    chart.data.datasets[2].data = pardalData;
+    chart.options.scales.y.min = -Math.ceil(maxVal * 1.15);
+    chart.options.scales.y.max =  Math.ceil(maxVal * 1.15);
+    chart.update('none');
+    return;
+  }
   if (chart) chart.destroy();
 
   chart = new Chart(ctx, {
